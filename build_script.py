@@ -33,13 +33,36 @@ def main():
             f.write(cmake_content)
         print("Patched CMakeLists.txt to force aio28-modern board")
 
-    # 4. Build Firmware
+    # 4. Patch aio28_modern_board.cc for ADC migration
+    board_cc_path = os.path.join(clone_dir, "main", "boards", "aio28-modern", "aio28_modern_board.cc")
+    if os.path.exists(board_cc_path):
+        print("Patching ADC driver in aio28_modern_board.cc...")
+        with open(board_cc_path, "r") as f:
+            content = f.read()
+        
+        # Replace legacy include
+        content = content.replace('#include <driver/adc.h>', 
+                                  '#include "esp_adc/adc_oneshot.h"\n#include "esp_adc/adc_cali.h"\n#include "esp_adc/adc_cali_scheme.h"')
+        
+        # This is a generic patch. Depending on how ADC is used, more replacements might be needed.
+        # For simple voltage reading, the new API requires initializing an adc_oneshot_unit_handle_t
+        # If the build fails again due to specific adc_xxx() functions, we will need to replace those calls.
+        # Often, projects use a wrapper or the changes are localized.
+        # We will attempt a build with just the include change if the codebase handles conditional compilation,
+        # or we might need to modify the implementation. Let's see if this resolves the immediate missing header error.
+
+        with open(board_cc_path, "w") as f:
+            f.write(content)
+        print("ADC header patched.")
+
+    # 5. Build Firmware
     os.chdir(clone_dir)
     
     print("Setting up ESP-IDF target...")
     subprocess.run(". $IDF_PATH/export.sh && idf.py set-target esp32s3", shell=True, executable='/bin/bash', check=True)
     
     print("Building...")
+    # Add -w flag to temporarily suppress warnings as errors if applicable, though this error is fatal.
     subprocess.run(". $IDF_PATH/export.sh && idf.py build", shell=True, executable='/bin/bash', check=True)
     
     print("Merging binaries...")
