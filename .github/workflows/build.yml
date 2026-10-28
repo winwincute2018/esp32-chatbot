@@ -1,0 +1,248 @@
+name: Build Firmware aio28-modern
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+    inputs:
+      server_url:
+        description: 'URL máy chủ WebSocket (vd: ws://192.168.1.100:8080/xiaozhi/v2/)'
+        required: false
+        default: ''
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      # ── 1. Lấy mã nguồn xiaozhi-esp32 ───────────────────────────────────
+      - name: Checkout xiaozhi-esp32
+        uses: actions/checkout@v4
+        with:
+          repository: 78/xiaozhi-esp32
+          ref: main
+          submodules: recursive
+          path: xiaozhi-esp32
+
+      # ── 2. Lấy board tùy biến ────────────────────────────────────────────
+      - name: Checkout my board
+        uses: actions/checkout@v4
+        with:
+          path: my-board
+
+      # ── 3. Copy board vào đúng vị trí ────────────────────────────────────
+      - name: Copy board files
+        run: |
+          cp -r my-board/main/boards/aio28-modern \
+                xiaozhi-esp32/main/boards/aio28-modern
+          echo "Files copied:"
+          ls xiaozhi-esp32/main/boards/aio28-modern/
+
+      # ── 4. Patch Kconfig — chèn entry board MỚI vào đúng chỗ ───────────
+      - name: Patch Kconfig.projbuild
+        working-directory: xiaozhi-esp32
+        run: |
+          python3 - <<'PYEOF'
+          import pathlib, re
+
+          f = pathlib.Path("main/Kconfig.projbuild")
+          txt = f.read_text()
+
+          # Entry cần chèn — đây là một symbol bình thường trong choice,
+          # KHÔNG có default vì default trong choice gây vòng lặp.
+          new_entry = (
+              "\n"
+              "    config BOARD_TYPE_AIO28_MODERN\n"
+              "        bool \"AIDEEPEN ES3C28P 2.8 Modern UI\"\n"
+              "        depends on IDF_TARGET_ESP32S3\n"
+          )
+
+          # Tìm vị trí đầu tiên của một entry "config BOARD_TYPE_" bên trong
+          # choice BOARD_TYPE để chèn TRƯỚC nó (an toàn nhất).
+          marker = "    config BOARD_TYPE_BREAD_COMPACT_WIFI\n"
+          if new_entry.strip() in txt:
+              print("Entry đã tồn tại, bỏ qua.")
+          elif marker in txt:
+              txt = txt.replace(marker, new_entry + marker, 1)
+              f.write_text(txt)
+              print("Kconfig patched OK — chèn trước BREAD_COMPACT_WIFI")
+          else:
+              raise RuntimeError(
+                  "Không tìm thấy marker trong Kconfig.projbuild!\n"
+                  "Nội dung đầu file:\n" + txt[:2000]
+              )
+          PYEOF
+
+      # ── 5. Patch CMakeLists.txt — thêm branch board mới ─────────────────
+      - name: Patch CMakeLists.txt
+        working-directory: xiaozhi-esp32
+        run: |
+          python3 - <<'PYEOF'
+          import pathlib
+
+          f = pathlib.Path("main/CMakeLists.txt")
+          txt = f.read_text()
+
+          snippet = (
+              "elseif(CONFIG_BOARD_TYPE_AIO28_MODERN)\n"
+              "    set(BOARD_DIR \"aio28-modern\")\n"
+              "    set(BUILTIN_TEXT_FONT font_puhui_basic_14_1)\n"
+              "    set(BUILTIN_ICON_FONT font_awesome_14_1)\n"
+              "    set(DEFAULT_EMOJI_COLLECTION twemoji_32)\n"
+          )
+
+          # Marker: dòng bắt đầu "else()" cuối cùng trong khối if/elseif board
+          # Tìm vị trí BREAD_COMPACT_WIFI trong cmake để chèn trước nó
+          marker = "elseif(CONFIG_BOARD_TYPE_BREAD_COMPACT_WIFI)\n"
+          alt_marker = "\nelse()"
+
+          if "CONFIG_BOARD_TYPE_AIO28_MODERN" in txt:
+              print("CMakeLists đã có entry, bỏ qua.")
+          elif marker in txt:
+              txt = txt.replace(marker, snippet + marker, 1)
+              f.write_text(txt)
+              print("CMakeLists.txt patched OK — chèn trước BREAD_COMPACT_WIFI")
+          else:
+              # fallback: chèn trước else() cuối
+              idx = txt.rfind(alt_marker)
+              if idx == -1:
+                  raise RuntimeError("Không tìm thấy marker trong CMakeLists.txt")
+              txt = txt[:idx] + "\n" + snippet + txt[idx:]
+              f.write_text(txt)
+              print("CMakeLists.txt patched OK — chèn trước else()")
+          PYEOF
+
+      # ── 6. In ra để kiểm tra patch ───────────────────────────────────────
+      - name: Verify patches
+        working-directory: xiaozhi-esp32
+        run: |
+          echo "=== Kconfig (xung quanh AIO28) ==="
+          grep -n "AIO28\|BREAD_COMPACT_WIFI" main/Kconfig.projbuild | head -10
+          echo ""
+          echo "=== CMakeLists (xung quanh AIO28) ==="
+          grep -n "AIO28\|BREAD_COMPACT_WIFI" main/CMakeLists.txt | head -10
+
+      # ── 7. Ghi URL máy chủ tùy chỉnh ────────────────────────────────────
+      - name: Set custom server URL
+        if: ${{ github.event.inputs.server_url != '' }}
+        working-directory: xiaozhi-esp32
+        run: |
+          echo 'CONFIG_WEBSOCKET_URL="${{ github.event.inputs.server_url }}"' \
+            >> sdkconfig.defaults
+
+      # ── 8. Cache ESP-IDF v6.0.2 ──────────────────────────────────────────
+      - name: Cache ESP-IDF
+        id: cache-idf
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/esp-idf
+            ~/.espressif
+          key: esp-idf-v6.0.2-${{ runner.os }}-v3
+
+      - name: Install ESP-IDF v6.0.2
+        if: steps.cache-idf.outputs.cache-hit != 'true'
+        run: |
+          git clone --depth 1 --branch v6.0.2 \
+            https://github.com/espressif/esp-idf.git ~/esp-idf
+          cd ~/esp-idf
+          git submodule update --init --recursive --depth 1
+          ./install.sh esp32s3
+
+      - name: Activate ESP-IDF (cache hit)
+        if: steps.cache-idf.outputs.cache-hit == 'true'
+        run: ~/esp-idf/install.sh esp32s3
+
+      # ── 9. Cache managed components ──────────────────────────────────────
+      - name: Cache managed components
+        uses: actions/cache@v4
+        with:
+          path: xiaozhi-esp32/managed_components
+          key: idf-comp-${{ hashFiles('xiaozhi-esp32/main/idf_component.yml') }}-v6-r2
+
+      # ── 10. Ghi sdkconfig.defaults chọn board ───────────────────────────
+      - name: Write sdkconfig for board
+        working-directory: xiaozhi-esp32
+        run: |
+          # Chỉ append — không ghi đè file defaults gốc
+          cat >> sdkconfig.defaults <<'SDKEOF'
+          CONFIG_BOARD_TYPE_AIO28_MODERN=y
+          CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+          SDKEOF
+          echo "sdkconfig.defaults hiện tại:"
+          cat sdkconfig.defaults
+
+      # ── 11. Build ─────────────────────────────────────────────────────────
+      - name: Build firmware
+        working-directory: xiaozhi-esp32
+        run: |
+          source ~/esp-idf/export.sh
+          idf.py set-target esp32s3
+          idf.py reconfigure
+          idf.py build 2>&1 | tail -50
+
+          echo ""
+          echo "=== Kết quả build ==="
+          ls -lh build/merged-binary.bin 2>/dev/null || \
+          ls -lh build/*.bin 2>/dev/null | head -10
+
+      # ── 12. Đóng gói để tải xuống ────────────────────────────────────────
+      - name: Package flash files
+        working-directory: xiaozhi-esp32
+        run: |
+          mkdir -p flash_pkg
+          cp build/merged-binary.bin        flash_pkg/ 2>/dev/null || true
+          cp build/bootloader/bootloader.bin flash_pkg/ 2>/dev/null || true
+          cp build/partition_table/partition-table.bin flash_pkg/ 2>/dev/null || true
+          cp build/flash_args               flash_pkg/ 2>/dev/null || true
+
+          cat > flash_pkg/HUONG_DAN_NAP.txt <<'TXTEOF'
+          ==============================================
+          HƯỚNG DẪN NẠP FIRMWARE AIDEEPEN ES3C28P
+          ==============================================
+
+          1. Cài esptool:
+             pip install esptool
+
+          2. Windows (thay COM3 bằng cổng thực tế của bạn):
+             esptool.exe --chip esp32s3 --port COM3 --baud 921600 write_flash 0x0 merged-binary.bin
+
+          3. Linux/Mac (thay /dev/ttyUSB0):
+             esptool.py --chip esp32s3 --port /dev/ttyUSB0 --baud 921600 write_flash 0x0 merged-binary.bin
+
+          Nếu báo lỗi kết nối: giữ nút BOOT rồi cắm lại cáp USB, thử lại.
+
+          Sau khi nạp xong: khởi động lại board, kết nối Wi-Fi qua
+          trang cấu hình (SSID: XIAOZHI-SETUP), rồi nhập URL máy chủ.
+          TXTEOF
+
+          echo "Flash package:"
+          ls -lh flash_pkg/
+
+      # ── 13. Upload artifact ───────────────────────────────────────────────
+      - name: Upload firmware
+        uses: actions/upload-artifact@v4
+        with:
+          name: firmware-aio28-modern-${{ github.run_number }}
+          path: xiaozhi-esp32/flash_pkg/
+          retention-days: 30
+          if-no-files-found: error
+
+      # ── 14. Tóm tắt ──────────────────────────────────────────────────────
+      - name: Summary
+        if: always()
+        working-directory: xiaozhi-esp32
+        run: |
+          echo "## Build aio28-modern #${{ github.run_number }}" >> $GITHUB_STEP_SUMMARY
+          if ls build/merged-binary.bin &>/dev/null; then
+            SIZE=$(du -sh build/merged-binary.bin | cut -f1)
+            echo "### ✅ Thành công — merged-binary.bin: $SIZE" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "**Lệnh nạp firmware:**" >> $GITHUB_STEP_SUMMARY
+            echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+            echo "esptool.py --chip esp32s3 --port COM3 --baud 921600 write_flash 0x0 merged-binary.bin" >> $GITHUB_STEP_SUMMARY
+            echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "### ❌ Build thất bại — xem log bên trên" >> $GITHUB_STEP_SUMMARY
+          fi
