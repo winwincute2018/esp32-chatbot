@@ -1,4 +1,4 @@
-name: Auto Build Xiaozhi with Modern UI
+name: Build Xiaozhi AIO28 Modern
 
 on:
   push:
@@ -13,40 +13,18 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-        with:
-          submodules: recursive
 
-      - name: Setup Modern UI Files
-        run: |
-          mkdir -p xiaozhi-esp32/main/display/lvgl_display/
-          cp patch_files/modern_ui.h xiaozhi-esp32/main/display/lvgl_display/
-          cp patch_files/modern_ui.cpp xiaozhi-esp32/main/display/lvgl_display/
-          
-      - name: Auto-Inject UI Code
-        run: python patch_files/inject_ui.py
-
-      - name: Configure and Build for custom_board_28aio
-        working-directory: xiaozhi-esp32
-        run: |
-          . $IDF_PATH/export.sh
-          
-          export BOARD=custom_board_28aio
-          idf.py set-target esp32s3
-          
-          if [ -f "configs/custom_board_28aio.conf" ]; then
-             cp configs/custom_board_28aio.conf sdkconfig
-          fi
-          
-          idf.py build
-          
-          python -m pip install esptool
-          esptool.py --chip esp32s3 merge_bin -o build/merged-binary.bin @build/flasher_args.json
+      - name: Run Build Script
+        run: python build_script.py
 
       - name: Upload Firmware Artifacts
         uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: firmware-custom_board_28aio-modern-ui
+          name: firmware-aio28-modern-merged
           path: |
-            xiaozhi-esp32/build/**/*.bin
+            xiaozhi-esp32/build/merged-binary.bin
+            xiaozhi-esp32/build/xiaozhi.bin
+            xiaozhi-esp32/build/bootloader/bootloader.bin
+            xiaozhi-esp32/build/partition_table/partition-table.bin
             xiaozhi-esp32/build/flasher_args.json
